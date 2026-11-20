@@ -39,7 +39,13 @@ class HoldType(IntEnum):
 
 
 DEFAULT_PORT = 7878
+
+# We use an invalid command for the heartbeat, so that we will get a response in the form
+# of an error.
 HEARTBEAT_INTERVAL = 55  # seconds (thermostat expects every 60s)
+HEARTBEAT_COMMAND = "heartbeat-error-expected"
+HEARTBEAT_TIMEOUT = 10  # seconds to wait for that answer before the session is declared dead
+
 CONNECT_TIMEOUT = 10
 PAIRING_TIMEOUT = 120
 RESPONSE_TIMEOUT = 10

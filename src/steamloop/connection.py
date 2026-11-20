@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import ssl
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -25,6 +26,8 @@ from .const import (
     DEFAULT_HEAT_SETPOINT,
     DEFAULT_PORT,
     HEARTBEAT_INTERVAL,
+    HEARTBEAT_COMMAND,
+    HEARTBEAT_TIMEOUT,
     INITIAL_STATE_TIMEOUT,
     PAIRING_TIMEOUT,
     RECONNECT_DELAY,
@@ -243,6 +246,8 @@ class ThermostatConnection:
         self.state = ThermostatState()
         self._event_callbacks: list[Callable[[dict[str, Any]], None]] = []
         self._connected = False
+        # Set whenever any message arrives, so a caller can wait for the next one.
+        self._message_received = asyncio.Event()
 
     @property
     def connected(self) -> bool:
@@ -373,6 +378,7 @@ class ThermostatConnection:
 
     def _on_message(self, msg: dict[str, Any]) -> None:
         """Called by the protocol for every complete message."""
+        self._message_received.set()
         self._dispatch(msg)
         if self._message_queue is not None:
             self._message_queue.put_nowait(msg)
@@ -628,11 +634,50 @@ class ThermostatConnection:
     # --- Background tasks ---
 
     async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to keep the connection alive."""
+        """Send the heartbeat, and notice when the thermostat stops answering it.
+
+        The Trane thermostat behaves weirdly when two connections are made.
+        It accepts commands from both connections, but sends all replies only to the most
+        recent one. The old connection is kept open, the thermostat receives data,
+        sends ACK packets, but never sends any data back. The result is the client
+        having a perfectly working command channel, but never getting any state updates
+        from the thermostat. Closing the second connection does not cause the thermostat
+        to start sending responses to the first connection.
+
+        The built-in "heartbeat" command returns nothing. It can work to keep the connection open,
+        but it cannot detect whether we are receiving the updates from the thermostat.
+        Instead we use an invalid command, which we know should send us an error back.
+        If we don't get the error back, the connection doesn't work and we can reconnect.
+        """
+        next_send = time.monotonic() + HEARTBEAT_INTERVAL
         while self._connected:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            if self._connected and self._protocol is not None:
-                self._protocol.send({"Heartbeat": {}})
+            await asyncio.sleep(max(next_send - time.monotonic(), 0.0))
+            if not self._connected or self._protocol is None:
+                return
+            next_send += HEARTBEAT_INTERVAL
+            if not await self._send_heartbeat():
+                return
+
+    async def _send_heartbeat(self) -> bool:
+        """Return True when the thermostat answered, False when the session is dead."""
+
+        # We check if we receive any message during the response interval.
+        # Even if it is not the answer to our invalid heartbeat command,
+        # it shows the connection is live.
+        self._message_received.clear()
+        self.send_request(HEARTBEAT_COMMAND, {})
+        try:
+            await asyncio.wait_for(self._message_received.wait(), timeout=HEARTBEAT_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Thermostat did not answer the heartbeat within %ss, closing the connection",
+                HEARTBEAT_TIMEOUT,
+            )
+            # Closing the transport clears the connected flag and makes asyncio call
+            # connection_lost(), which is what wakes the reconnect loop.
+            self._close_transport()
+            return False
+        return True
 
     async def _run_loop(self) -> None:
         """

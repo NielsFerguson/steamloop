@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ssl
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -819,9 +820,97 @@ async def test_heartbeat_loop_sends_heartbeat(
     assert transport.write.call_count >= 1
 
 
+async def test_heartbeat_loop_closes_connection_when_heartbeat_is_unanswered(
+    connection: ThermostatConnection,
+) -> None:
+    """An unanswered heartbeat means the session is dead, so the connection is closed."""
+    with (
+        patch("steamloop.connection.HEARTBEAT_INTERVAL", 0.01),
+        patch("steamloop.connection.HEARTBEAT_TIMEOUT", 0.02),
+    ):
+        task = asyncio.create_task(connection._heartbeat_loop())
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert connection._connected is False
+    assert connection._protocol is None
+
+
+async def test_heartbeat_loop_keeps_connection_when_heartbeat_is_answered(
+    connection: ThermostatConnection,
+) -> None:
+    """Any reply to the heartbeat keeps the session alive."""
+
+    async def answer() -> None:
+        while connection._connected:
+            await asyncio.sleep(0.005)
+            # Any message satisfies the heartbeat. The device answers an unknown command
+            # with an error, so that is what the fake thermostat sends back.
+            connection._on_message(
+                {"Response": {"Error": {"error_type": "unknown", "description": "unknown"}}}
+            )
+
+    with (
+        patch("steamloop.connection.HEARTBEAT_INTERVAL", 0.01),
+        patch("steamloop.connection.HEARTBEAT_TIMEOUT", 0.2),
+    ):
+        responder = asyncio.create_task(answer())
+        task = asyncio.create_task(connection._heartbeat_loop())
+        await asyncio.sleep(0.15)
+        alive = connection._connected
+        connection._connected = False
+        for job in (task, responder):
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+    assert alive is True
+
+
 # ---------------------------------------------------------------------------
 # Run loop — reconnect with backoff
 # ---------------------------------------------------------------------------
+
+
+async def test_heartbeat_cadence_does_not_drift_when_replies_are_slow(
+    connection: ThermostatConnection,
+) -> None:
+    """The time spent waiting for an answer must not be added to the interval."""
+    stamps: list[float] = []
+
+    def record(*_args: object, **_kwargs: object) -> None:
+        stamps.append(asyncio.get_running_loop().time())
+
+    connection._protocol.send_request.side_effect = record  # type: ignore[union-attr]
+
+    async def answer() -> None:
+        while connection._connected:
+            await asyncio.sleep(0.04)
+            # Any message satisfies the heartbeat. The device answers an unknown command
+            # with an error, so that is what the fake thermostat sends back.
+            connection._on_message(
+                {"Response": {"Error": {"error_type": "unknown", "description": "unknown"}}}
+            )
+
+    with (
+        patch("steamloop.connection.HEARTBEAT_INTERVAL", 0.1),
+        patch("steamloop.connection.HEARTBEAT_TIMEOUT", 0.5),
+    ):
+        responder = asyncio.create_task(answer())
+        task = asyncio.create_task(connection._heartbeat_loop())
+        await asyncio.sleep(0.62)
+        connection._connected = False
+        for job in (task, responder):
+            job.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+    gaps = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
+    assert gaps, "no heartbeat was sent"
+    # Interval plus the 0.04 s answer would be 0.14 s if the wait were added.
+    assert max(gaps) < 0.13, gaps
 
 
 async def test_run_loop_reconnects_on_connection_lost() -> None:
